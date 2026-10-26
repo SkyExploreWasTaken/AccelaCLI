@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import sys
 import zipfile
 from pathlib import Path
@@ -134,9 +135,22 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     download.add_argument("--branch", help="Manifest branch when using --appid")
     download.add_argument(
+        "--hubcap-api-key",
+        help=(
+            "Hubcap manifest API key for --appid; prefer "
+            "ACCELACLI_HUBCAP_API_KEY"
+        ),
+    )
+    download.add_argument(
         "--platform",
         choices=("windows", "linux", "macos"),
-        default="windows" if sys.platform == "win32" else sys.platform,
+        default=(
+            "windows"
+            if sys.platform == "win32"
+            else "macos"
+            if sys.platform == "darwin"
+            else "linux"
+        ),
         help="Platform used for automatic depot selection (default: current platform)",
     )
     download.add_argument(
@@ -162,6 +176,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--config",
         type=Path,
         help="Component source TOML path (default: generated AccelaCLI config)",
+    )
+    serve.add_argument(
+        "--hubcap-api-key",
+        help=(
+            "Hubcap manifest API key for AppID jobs; prefer "
+            "ACCELACLI_HUBCAP_API_KEY"
+        ),
     )
     return parser
 
@@ -460,6 +481,21 @@ def _manifest_path(args: argparse.Namespace, output: CommandOutput) -> Path:
     return Path(path)
 
 
+def _configure_hubcap_api_key(args: argparse.Namespace) -> None:
+    """Make the configured Hubcap key available to the manifest API client."""
+    api_key = getattr(args, "hubcap_api_key", None) or os.environ.get(
+        "ACCELACLI_HUBCAP_API_KEY", ""
+    )
+    if not api_key:
+        return
+
+    from utils.settings import get_settings
+
+    settings = get_settings()
+    settings.setValue("morrenus_api_key", api_key)
+    settings.sync()
+
+
 def run_download(
     args: argparse.Namespace,
     logger: logging.Logger,
@@ -474,6 +510,7 @@ def run_download(
     ensure_config_file(args.config)
     from utils.settings import get_settings
 
+    _configure_hubcap_api_key(args)
     output = CommandOutput(args.json, event_sink=event_sink)
     manifest = _manifest_path(args, output)
     destination = args.destination.expanduser().resolve()
@@ -591,6 +628,8 @@ def main(argv: list[str] | None = None) -> int:
             ensure_config_file(args.path)
         else:
             ensure_config_file(getattr(args, "config", None))
+        if args.command == "serve":
+            _configure_hubcap_api_key(args)
 
         if args.command == "manifest":
             return run_manifest_command(args)

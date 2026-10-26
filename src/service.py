@@ -162,7 +162,14 @@ def _request_to_namespace(request: dict[str, Any]):
         enable_netsock_default=request.get("netsock"),
         branch=request.get("branch"),
         platform=request.get(
-            "platform", "windows" if sys.platform == "win32" else sys.platform
+            "platform",
+            (
+                "windows"
+                if sys.platform == "win32"
+                else "macos"
+                if sys.platform == "darwin"
+                else "linux"
+            ),
         ),
         json=False,
         config=Path(request["config"]) if request.get("config") else None,
@@ -258,5 +265,4 @@ def run_service(args: Any, logger_: logging.Logger) -> int:
         server.jobs.cancel_all()
         server.server_close()
     return 0
-
 

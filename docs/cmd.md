@@ -9,8 +9,19 @@ wait for interactive depot selections.
 AccelaCLI download --appid 123 --destination "C:\Games\SteamLibrary"
 ```
 
-The manifest is fetched from Hubcap using the configured API key. The command
-automatically selects depots compatible with the current platform.
+The manifest is fetched from Hubcap using the configured API key. Configure it
+for headless use with an environment variable:
+
+```powershell
+$env:ACCELACLI_HUBCAP_API_KEY = "YOUR_KEY"
+AccelaCLI download --appid 123 --destination "C:\Games\SteamLibrary"
+```
+
+You can also pass `--hubcap-api-key KEY` to `download` or `serve`, although
+environment variables are preferable because command-line arguments may be
+visible to other local processes. The command automatically selects depots
+compatible with the current platform. Downloads from an existing
+`--manifest FILE.zip` do not require a Hubcap API key.
 
 ## Download an existing manifest
 
@@ -255,7 +266,7 @@ POST /jobs/JOB_ID/cancel
 X-AccelaCLI-Token: TOKEN
 ```
 
-Jobs are processed serially to avoid running multiple Qt-backed download tasks
-in the same process. Bind to `127.0.0.1` unless network access is explicitly
-needed. If a custom component-source file is required, start the service with
+Jobs are processed serially to avoid running multiple download tasks in the same
+process. Bind to `127.0.0.1` unless network access is explicitly needed. If a
+custom component-source file is required, start the service with
 `--config PATH` or include `"config": "PATH"` in a job request.
