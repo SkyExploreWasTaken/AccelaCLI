@@ -1,0 +1,725 @@
+import logging
+import os
+import platform
+import re
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import List, Optional
+
+from utils.activity import is_our_logger
+from utils.cmd_helpers import get_base_path
+
+# Constants
+APP_NAME = "AccelaCLI"
+MAX_PREVIOUS_LOGS = 3
+
+logger = logging.getLogger(__name__)
+
+
+class SensitiveDataFilter(logging.Filter):
+    """
+    Sanitizes log records to ensure no personal or sensitive data (API keys,
+    passwords, auth tokens, usernames) is leaked into logs or console output.
+    """
+
+    PATTERNS = [
+        # Hubcap / Morrenus API keys (e.g. smm_abc123...)
+        (re.compile(r"smm_[a-zA-Z0-9_-]{16,}", re.IGNORECASE), "[REDACTED_API_KEY]"),
+        # Bearer tokens in headers
+        (re.compile(r"Bearer\s+[a-zA-Z0-9._~+/-]+", re.IGNORECASE), "Bearer [REDACTED_TOKEN]"),
+        # URL or JSON auth parameters
+        (
+            re.compile(
+                r"(api_key|apikey|morrenus_api_key|access_token|secret_key|private_key|token)[=:\s]+([\"']?)([^\s,\"\'&]+)([\"']?)",
+                re.IGNORECASE,
+            ),
+            r"\1=\2[REDACTED_KEY]\4",
+        ),
+        (
+            re.compile(
+                r"(password|steam_password|passwd)[=:\s]+([\"']?)([^\s,\"\'&]+)([\"']?)",
+                re.IGNORECASE,
+            ),
+            r"\1=\2[REDACTED_PASSWORD]\4",
+        ),
+        # CLI flag passwords (e.g. -password mypass, -pass mypass)
+        (re.compile(r"(-password|-pass)\s+([^\s]+)", re.IGNORECASE), r"\1 [REDACTED_PASSWORD]"),
+    ]
+
+    @classmethod
+    def sanitize_text(cls, text: str) -> str:
+        if not isinstance(text, str) or not text:
+            return text
+
+        # Apply regex pattern redactions
+        for pattern, replacement in cls.PATTERNS:
+            text = pattern.sub(replacement, text)
+
+        # Also redact the configured user API key and steam credentials if stored in settings
+        try:
+            from utils.settings import get_settings
+
+            settings = get_settings()
+            if settings:
+                api_key = settings.value("morrenus_api_key", "", type=str)
+                if api_key and len(api_key) > 5 and api_key in text:
+                    text = text.replace(api_key, "[REDACTED_API_KEY]")
+                steam_pass = settings.value("steam_password", "", type=str)
+                if steam_pass and len(steam_pass) > 3 and steam_pass in text:
+                    text = text.replace(steam_pass, "[REDACTED_PASSWORD]")
+        except Exception:
+            pass
+
+        return text
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg and isinstance(record.msg, str):
+            record.msg = self.sanitize_text(record.msg)
+        if record.args:
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: (self.sanitize_text(v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+            elif isinstance(record.args, (list, tuple)):
+                record.args = tuple(
+                    self.sanitize_text(arg) if isinstance(arg, str) else arg for arg in record.args
+                )
+        return True
+
+
+class SanitizingFormatter(logging.Formatter):
+    """Formatter that strips sensitive information from all log outputs."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        s = super().format(record)
+        return SensitiveDataFilter.sanitize_text(s)
+
+
+class _Signal:
+    def __init__(self) -> None:
+        self._callbacks = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self, value) -> None:
+        for callback in tuple(self._callbacks):
+            callback(value)
+
+
+class StructuredLogHandler(logging.Handler):
+    """Emit structured log records for optional observers.
+
+    Emits a dict, not a pre-rendered string. The status pager used to
+    substring-match the formatted text against a list of "interesting" keywords,
+    which silently dropped real events when wording changed and flickered noise
+    whenever a message happened to contain a word like "run". Carrying the
+    level and the ``user_visible``/``category`` fields let observers select on
+    intent instead of guessing from prose.
+
+    Keys: ``text``, ``level``, ``levelname``, ``user_visible``, ``category``,
+    ``logger``.
+    """
+
+    new_record = _Signal()
+    flushOnClose = False
+
+    def __init__(self):
+        super().__init__()
+        self.new_record = _Signal()
+        self.setFormatter(StructuredLogFormatter())
+        self.addFilter(SensitiveDataFilter())
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            explicit = getattr(record, "user_visible", None)
+            if explicit is None:
+                # No explicit intent on the record. Show our own INFO and above,
+                # but never a dependency: a third-party warning carries message
+                # shapes we do not control and belongs in the file, not a
+                # user-facing strip.
+                visible = (
+                    record.levelno >= logging.INFO
+                    and is_our_logger(record.name)
+                )
+            else:
+                visible = bool(explicit)
+            # Formatting sanitizes the message, which costs five regex passes
+            # plus two settings lookups per record. A library scan emits about a
+            # thousand DEBUG records in two seconds and every one of them was
+            # sanitized and then thrown away, which was a measurable part of the
+            # boot cost. Invisible records carry no text; the status pager
+            # discards them before reading it.
+            text = SensitiveDataFilter.sanitize_text(self.format(record)) if visible else ""
+            payload = {
+                "text": text,
+                "level": record.levelno,
+                "levelname": record.levelname,
+                "user_visible": visible,
+                "category": getattr(record, "category", "general"),
+                "logger": record.name,
+            }
+            self.new_record.emit(payload)
+        except RuntimeError:
+            pass
+
+    def flush(self) -> None:
+        pass
+
+
+class StructuredLogFormatter(logging.Formatter):
+    """Custom formatter that keeps logs clean, minimal, and sanitized."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        if record.levelno >= logging.WARNING:
+            msg = f"[{record.levelname}] {record.getMessage()}"
+        else:
+            msg = record.getMessage()
+        return SensitiveDataFilter.sanitize_text(msg)
+
+
+# Global handler instance
+structured_log_handler = StructuredLogHandler()
+_current_log_name: Optional[str] = None
+_log_dir = get_base_path() / "logs"
+
+
+class LineRotatingFileHandler(logging.FileHandler):
+    """Trims the log to the newest ``max_lines`` lines.
+
+    Rotation is atomic (write a temp file, then ``os.replace``) and reopens the
+    handler's stream afterwards. Rewriting the file in place was corrupting it:
+    ``open(path, "w")`` truncates, but ``self.stream`` stayed open at its old
+    byte offset, so every later write landed past the new end of file and left
+    a NUL-filled hole. A 6.7 MB session log grew two such holes of 2.6 MB and
+    2.3 MB, which also made the file read as binary to text tools.
+    """
+
+    def __init__(self, filename, mode="a", encoding=None, delay=False, max_lines=10000):
+        super().__init__(filename, mode, encoding, delay)
+        self.max_lines = max_lines
+        self._emit_count = 0
+
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+        self._emit_count += 1
+        if self._emit_count >= 50:
+            self._emit_count = 0
+            try:
+                self.rotate_by_lines()
+            except Exception:
+                pass
+
+    def rotate_by_lines(self) -> None:
+        """Trim to the newest ``max_lines``, atomically, and re-point the stream."""
+        if not os.path.exists(self.baseFilename):
+            return
+        encoding = self.encoding or "utf-8"
+        try:
+            with open(self.baseFilename, "r", encoding=encoding, errors="ignore") as f:
+                lines = f.readlines()
+            if len(lines) <= self.max_lines:
+                return
+            keep_lines = lines[-self.max_lines :]
+
+            tmp = f"{self.baseFilename}.rotate.tmp"
+            with open(tmp, "w", encoding=encoding) as f:
+                f.writelines(keep_lines)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.baseFilename)
+        except Exception as e:
+            logger.debug(f"Log rotation failed: {e}")
+            return
+
+        # Re-open against the new inode. Without this the handler keeps writing
+        # at the old offset of the file that was just replaced.
+        try:
+            if self.stream:
+                self.stream.close()
+            self.stream = open(self.baseFilename, "a", encoding=encoding)
+        except Exception as e:
+            logger.debug(f"Could not reopen log stream after rotation: {e}")
+
+    def close(self):
+        try:
+            self.rotate_by_lines()
+        except Exception:
+            pass
+        super().close()
+
+
+class LogCategoryFilter(logging.Filter):
+    def __init__(self, level_str="INFO", category_str="All Modules"):
+        super().__init__()
+        if level_str.upper() == "NONE":
+            self.level = 100
+        else:
+            self.level = getattr(logging, level_str.upper(), logging.INFO)
+        self.category = category_str
+
+    def filter(self, record):
+        # 1. Filter by level
+        if record.levelno < self.level:
+            return False
+
+        # 2. Filter by category
+        if self.category == "All Modules":
+            return True
+        elif self.category == "Only Steam Client & API":
+            name = record.name.lower()
+            return "steam" in name or "client" in name or "scheevo" in name
+        elif self.category == "Only Downloads & Manifests":
+            name = record.name.lower()
+            return "download" in name or "manifest" in name or "task" in name or "job" in name
+        elif self.category == "Only Database & Library":
+            name = record.name.lower()
+            return (
+                "db_manager" in name
+                or "database" in name
+                or "game_manager" in name
+                or "library" in name
+            )
+
+        return True
+
+
+def update_log_filters():
+    """Update active log filters from current settings."""
+    try:
+        from utils.settings import get_settings
+
+        settings = get_settings()
+        if not settings:
+            return
+
+        level_str = settings.value("log_filter_level", "INFO", type=str) or "INFO"
+        category_str = settings.value("log_filter_category", "All Modules", type=str) or "All Modules"
+
+        root_logger = logging.getLogger()
+        for handler in root_logger.handlers:
+            # Remove any existing LogCategoryFilters
+            for filt in handler.filters[:]:
+                if isinstance(filt, LogCategoryFilter):
+                    handler.removeFilter(filt)
+
+            # The file is the bug-report artifact. It keeps redaction but opts
+            # out of the display filters: applying the user's on-screen level or
+            # category to it would strip DEBUG from the very file people attach
+            # when asking for help. Both are display concerns.
+            is_file = isinstance(handler, LineRotatingFileHandler)
+
+            # Ensure SensitiveDataFilter is attached to all handlers
+            has_sensitive_filter = any(
+                isinstance(f, SensitiveDataFilter) for f in handler.filters
+            )
+            if not has_sensitive_filter:
+                handler.addFilter(SensitiveDataFilter())
+
+            if not is_file:
+                handler.addFilter(LogCategoryFilter(level_str, category_str))
+                if level_str.upper() == "NONE":
+                    level_num = 100
+                else:
+                    level_num = getattr(logging, level_str.upper(), logging.INFO)
+                handler.setLevel(level_num)
+            else:
+                handler.setLevel(logging.DEBUG)
+
+    except Exception as e:
+        print(f"Error updating log filters: {e}", file=sys.stderr)
+
+
+def _create_file_handler(log_path: Path) -> Optional[LineRotatingFileHandler]:
+    """Attempt to create a line rotating file handler at the specified path.
+
+    The file is pinned to DEBUG and deliberately does NOT follow the user's
+    display level: it is the artifact attached to a bug report, so thinning it
+    based on a cosmetic preference loses exactly the detail needed to diagnose
+    the problem. The console and the status pager are what that setting is for.
+    """
+    formatter = SanitizingFormatter(
+        "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-34s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    try:
+        handler = LineRotatingFileHandler(
+            log_path,
+            mode="w",  # Start fresh for each session
+            encoding="utf-8",
+            max_lines=10000,
+            delay=False,
+        )
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(formatter)
+        handler.addFilter(SensitiveDataFilter())
+        print(f"Log file created: {log_path}", file=sys.stderr)
+        return handler
+    except (PermissionError, OSError) as e:
+        print(f"Error: Could not create log file at {log_path}: {e}", file=sys.stderr)
+        return None
+
+
+class _StderrTee:
+    """Tee ``sys.stderr`` into the log file.
+
+    Two jobs. First, it captures ``Fatal Python error:`` output from hard
+    crashes and interpreter errors which would otherwise vanish inside the
+    AppImage. Second, it captures the SLSsteam subprocess's progress bar, which
+    is genuinely useful but floods the log: one download emitted 8,636 raw
+    progress lines - 77% of a 10,000-line file.
+
+    So progress lines are folded to a periodic single-line summary instead of
+    being dumped verbatim, and anything that looks like a crash is passed
+    through immediately and in full.
+
+    The file stream is looked up through ``_handler`` on every write rather than
+    captured once, because the handler re-opens its stream after rotation; a
+    captured reference would keep writing into the replaced, unlinked file and
+    silently lose the crash output that is this class's whole point.
+    """
+
+    # Raw progress lines such as "82.38% /home/.../Two Point Museum"
+    _PROGRESS_RE = re.compile(r"^\s*\d{1,3}(?:\.\d+)?\s*%\s+\S")
+    _INTERESTING = (
+        "error", "fatal", "traceback", "exception", "panic", "segmentation",
+        "assert", "warning", "failed",
+    )
+    _SUMMARY_EVERY = 25
+
+    def __init__(self, original_stderr, handler=None, file_stream=None):
+        self._original = original_stderr
+        self._handler = handler
+        self._file = file_stream
+        self._seen = 0
+        self._last_progress = ""
+
+    def _stream(self):
+        """Current log stream, following handler rotation."""
+        if self._handler is not None:
+            return getattr(self._handler, "stream", None)
+        return self._file
+
+    def _write_raw(self, data):
+        f = self._stream()
+        if f is None or f.closed:
+            return
+        if not data.endswith("\n"):
+            data += "\n"
+        f.write(data)
+        f.flush()
+
+    def _handle_subprocess_line(self, data: str) -> None:
+        """Log one stderr line, folding progress bars down to a summary.
+
+        Anything crash-shaped bypasses this and is written verbatim: the value of
+        the tee is that a fatal error survives, so it must never be summarised
+        away.
+        """
+        line = data.strip()
+        if not line:
+            return
+        low = line.lower()
+        if any(tok in low for tok in self._INTERESTING):
+            self._write_raw(data)
+            return
+        if self._PROGRESS_RE.match(line):
+            self._seen += 1
+            self._last_progress = line[:120]
+            if self._seen % self._SUMMARY_EVERY == 1:
+                self._write_raw(
+                    f"[SLSsteam progress] {self._last_progress} "
+                    f"(updates folded; showing every {self._SUMMARY_EVERY})\n"
+                )
+            return
+        # Ordinary subprocess chatter: keep it, it is usually short.
+        self._write_raw(data)
+
+    def write(self, data):
+        try:
+            self._original.write(data)
+            self._original.flush()
+        except Exception:
+            pass
+        try:
+            self._handle_subprocess_line(data)
+        except Exception:
+            pass
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+        try:
+            f = self._stream()
+            if f is not None and not f.closed:
+                f.flush()
+        except Exception:
+            pass
+
+    def fileno(self):
+        return self._original.fileno()
+
+    def isatty(self):
+        try:
+            return self._original.isatty()
+        except Exception:
+            return False
+
+
+def _install_stderr_tee(handler=None, file_stream=None) -> None:
+    """Replace sys.stderr with a tee writer so crash output goes to the log.
+
+    Pass the *handler*, not its stream, so the tee keeps writing to the current
+    file after a rotation replaces the inode.
+    """
+    try:
+        if not isinstance(sys.stderr, _StderrTee):
+            sys.stderr = _StderrTee(sys.stderr, handler=handler, file_stream=file_stream)
+    except Exception as e:
+        print(f"Failed to install stderr tee: {e}", file=sys.__stderr__)
+
+
+def _install_global_exception_hooks() -> None:
+    """Install sys.excepthook and threading.excepthook to route unhandled
+    exceptions from all threads into the logger instead of stderr."""
+    _exc_logger = logging.getLogger("AccelaCLI.crash")
+
+    def _handle_exception(exc_type, exc_value, exc_tb):
+        """Main thread unhandled exception hook."""
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        _exc_logger.critical(
+            "Unhandled exception on main thread",
+            exc_info=(exc_type, exc_value, exc_tb),
+        )
+
+    def _handle_thread_exception(args):
+        """Background thread unhandled exception hook (Python 3.8+)."""
+        if args.exc_type is SystemExit:
+            return
+        thread_name = getattr(args.thread, "name", "<unknown>") if args.thread else "<unknown>"
+        _exc_logger.critical(
+            f"Unhandled exception in background thread '{thread_name}'",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    try:
+        sys.excepthook = _handle_exception
+    except Exception:
+        pass
+
+    try:
+        import threading
+        threading.excepthook = _handle_thread_exception
+    except (AttributeError, Exception):
+        # threading.excepthook is Python 3.8+; silently skip on older builds
+        pass
+
+
+# Third-party loggers that were measured flooding the file. The root logger sits
+# at DEBUG so our own diagnostics are complete, which means these inherited that
+# too: urllib3.connectionpool alone produced 551 lines and SteamClient 130 in a
+# single session - about 23% of the file, all of it connection-pool bookkeeping.
+#
+# They stay visible when the user explicitly asks for a debug log, because that
+# is exactly the situation where transport-level detail is useful.
+_THIRD_PARTY_LOGGERS = (
+    "urllib3",
+    "requests",
+    "SteamClient",
+    # Emitted by SteamClient's transport, not by us. Found still leaking two
+    # lines per session before being added.
+    "Connection",
+    "chardet",
+    "charset_normalizer",
+    "PIL",
+    "asyncio",
+    "websockets",
+    "hpack",
+    "httpcore",
+    "vdf",
+    "capstone",
+)
+
+
+def _quiet_third_party(level: int = logging.WARNING) -> None:
+    """Raise the floor for third-party loggers so they stop dominating the file."""
+    for name in _THIRD_PARTY_LOGGERS:
+        logging.getLogger(name).setLevel(level)
+
+
+def set_third_party_level(level: int) -> None:
+    """Enable third-party debug output, e.g. when writing a diagnostic log."""
+    _quiet_third_party(level)
+
+
+def setup_logging() -> logging.Logger:
+    cleanup_old_logs()
+
+    log_path = get_log_path()
+    system_platform = platform.system()
+    # Message first so the file stays greppable without reading timestamps.
+    # Milliseconds are kept because interleaved worker-thread output is hard to
+    # read without them, but the date is dropped from every line and written
+    # once in the header instead - it never changes within a session.
+    formatter = SanitizingFormatter(
+        "%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-34s | %(message)s",
+        datefmt="%H:%M:%S",
+    )
+
+    handlers: List[logging.Handler] = []
+
+    # 1. File Handler (Main Path)
+    file_handler = _create_file_handler(log_path)
+
+    # 2. File Handler (Fallback to TEMP if main fails)
+    if not file_handler:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        temp_dir = Path(os.environ.get("TEMP", os.getcwd()))
+        fallback_path = temp_dir / f"{APP_NAME}_{timestamp}.log"
+        print(f"Attempting fallback log: {fallback_path}", file=sys.stderr)
+        file_handler = _create_file_handler(fallback_path)
+
+    if file_handler:
+        handlers.append(file_handler)
+
+    # Console Handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    console_handler.addFilter(SensitiveDataFilter())
+    handlers.append(console_handler)
+
+    structured_log_handler.setLevel(logging.INFO)
+    structured_log_handler.setFormatter(StructuredLogFormatter())
+    handlers.append(structured_log_handler)
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+    root_logger.addFilter(SensitiveDataFilter())
+
+    # Reduce noise from third-party libraries when offline
+    logging.getLogger("CMServerList").setLevel(logging.CRITICAL)
+    _quiet_third_party()
+
+    # Clear existing handlers to avoid duplicates
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    # Add new handlers
+    for handler in handlers:
+        root_logger.addHandler(handler)
+
+    # Apply saved log filters
+    update_log_filters()
+
+    # ── Redirect stderr to the log file ──────────────────────────────────────
+    # Fatal interpreter crash tracebacks are written to stderr,
+    # which normally vanishes inside the AppImage. Tee stderr into the log file
+    # so these hard crashes are visible in the log viewer.
+    if file_handler and file_handler.stream:
+        _install_stderr_tee(handler=file_handler)
+
+    # ── Global exception hooks ────────────────────────────────────────────────
+    # Catch unhandled exceptions on the main thread and in background threads
+    # so they are written to the log instead of going silently to stderr.
+    _install_global_exception_hooks()
+
+    local_logger = logging.getLogger(__name__)
+
+    local_logger.info("Logging Initialized (Sensitive data redaction active)")
+    local_logger.info("Platform: %s", system_platform)
+    local_logger.info("Python: %s", sys.version)
+    local_logger.info("Log file: %s", log_path)
+
+    return local_logger
+
+
+def open_log_directory() -> bool:
+    """Open the log directory in the system file manager."""
+    global _log_dir
+
+    try:
+        system = platform.system().lower()
+        cmd = ["xdg-open"]
+
+        if system == "windows":
+            cmd = ["explorer"]
+
+        subprocess.run(cmd + [str(_log_dir)], check=False)
+        return True
+    except Exception as e:
+        local_logger = logging.getLogger(__name__)
+        local_logger.error("Failed to open log directory: %s", e)
+        return False
+
+
+def get_log_path() -> Path:
+    """Return path to a timestamped log file with counter if needed."""
+    global _current_log_name, _log_dir
+
+    try:
+        _log_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        temp_dir = Path(os.environ.get("TEMP", os.getcwd())) / "logs" / APP_NAME
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        _log_dir = temp_dir
+
+    # If an active log is already set and exists, reuse it
+    if _current_log_name and (_log_dir / _current_log_name).exists():
+        return _log_dir / _current_log_name
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    base_name = f"{APP_NAME}_{timestamp}"
+
+    counter = 1
+    while True:
+        if counter == 1:
+            log_name = f"{base_name}.log"
+        else:
+            log_name = f"{base_name}_{counter}.log"
+
+        log_path = _log_dir / log_name
+        if not log_path.exists():
+            break
+        counter += 1
+
+    _current_log_name = log_name
+    return log_path
+
+
+def cleanup_old_logs() -> None:
+    """Clean up old log files on startup."""
+    global MAX_PREVIOUS_LOGS
+
+    base_path = get_base_path()
+    log_dir = base_path / "logs"
+
+    if not log_dir.exists():
+        return
+
+    # Match both new AccelaCLI_*.log and legacy AccelaCLI_*.log files
+    log_files = [
+        f for f in log_dir.glob("*.log")
+        if f.is_file() and (f.name.startswith("AccelaCLI_") or f.name.startswith("AccelaCLI_"))
+    ]
+
+    if not log_files:
+        return
+
+    log_files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+
+    for old_log in log_files[MAX_PREVIOUS_LOGS:]:
+        try:
+            old_log.unlink()
+            print(f"Removed old log file: {old_log.name}", file=sys.stderr)
+        except OSError as e:
+            print(f"Could not remove {old_log.name}: {e}", file=sys.stderr)

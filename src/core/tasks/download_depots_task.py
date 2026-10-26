@@ -1,0 +1,1303 @@
+import logging
+import os
+import hashlib
+import random
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from typing import List, Tuple, Optional, Dict, Any
+
+from utils.cmd_helpers import (
+    resource_path,
+    ensure_dotnet_availability,
+    get_dotnet_path,
+    get_dotnet_env,
+    get_base_path,
+)
+from utils.settings import get_settings
+from utils.lua_parsing import iter_live_matches
+
+# Third-party imports
+try:
+    import psutil
+except ImportError:
+    logging.critical(
+        "Failed to import 'psutil'. Pausing/resuming downloads will not work."
+    )
+    psutil = None
+
+logger = logging.getLogger(__name__)
+
+
+class _Signal:
+    def __init__(self) -> None:
+        self._callbacks = []
+
+    def connect(self, callback) -> None:
+        self._callbacks.append(callback)
+
+    def emit(self, *args) -> None:
+        for callback in tuple(self._callbacks):
+            callback(*args)
+
+
+class DownloadDepotsTask:
+    """
+    Manages the downloading of Steam depots. Handles process management,
+    progress tracking, and pause/resume functionality.
+    """
+
+    progress = _Signal()
+    progress_percentage = _Signal()
+    speed_update = _Signal()
+    completed = _Signal()
+    error = _Signal()
+
+    def __init__(self):
+        self.progress = _Signal()
+        self.progress_percentage = _Signal()
+        self.speed_update = _Signal()
+        self.completed = _Signal()
+        self.error = _Signal()
+        self._is_running = True
+        self.percentage_regex = re.compile(r"(\d{1,3}(?:\.\d{1,2})?)%")
+        self.last_percentage = -1
+        self.process: Optional[subprocess.Popen] = None
+
+        self.total_download_size_for_this_job = 0
+        self.actual_download_bytes_for_this_job = 0
+        self.actual_uncompressed_bytes_for_this_job = 0
+        self._current_depot_downloaded_bytes = 0
+        self._current_depot_uncompressed_bytes = 0
+        self.completed_so_far_for_this_job = 0
+        self.current_depot_size = 0
+        self._last_log_time = 0
+        self._log_buffer = []
+        self.temp_file_list = None
+        self._last_speed_calc_time = 0.0
+        self._last_downloaded_bytes = 0.0
+        self._smooth_speed_bps = 0.0
+        self._is_validating = False
+        self._lancache_error_detected = False
+        self._current_depot_key_denied = False
+        self._current_depot_error_reason = ""
+        self._current_depot_zero_downloaded = False
+        self._current_depot_errors = 0
+        self._auto_enabled = False
+        self._auto_cap = 8
+        self._auto_best_key = "auto_tune_best"
+
+    @property
+    def is_running_flag(self) -> bool:
+        """Property to access the private running state safely."""
+        return self._is_running
+
+    def run(
+        self,
+        game_data: Dict[str, Any],
+        selected_depots: List[str],
+        dest_path: str,
+        max_downloads: Optional[int] = None,
+    ):
+        """
+        Main execution method to download selected depots.
+        """
+        logger.info(f"Download task starting for {len(selected_depots)} depots.")
+        current_cmd: Optional[List[str]] = None
+
+        try:
+            # Check for .NET 9 availability before proceeding (will attempt auto-install if missing)
+            self.progress.emit("Checking .NET 9 runtime availability...")
+            if not ensure_dotnet_availability():
+                self.progress.emit(
+                    "ERROR: .NET 9 runtime is required and could not be installed automatically."
+                )
+                logger.critical(".NET 9 runtime not available")
+                self.error.emit((RuntimeError, ".NET 9 runtime not available", None))
+                return
+
+            commands, skipped_depots, depot_sizes = self._prepare_downloads(
+                game_data, selected_depots, dest_path, max_downloads=max_downloads
+            )
+
+            if not commands:
+                if skipped_depots:
+                    err_msg = (
+                        f"Download aborted: Unable to obtain valid manifests for depot(s): {', '.join(skipped_depots)}. "
+                        "Please verify the depot ID or manifest ID, or choose another build."
+                    )
+                    logger.error(f"[DownloadDepotsTask] {err_msg}")
+                    self.progress.emit(f"ERROR: {err_msg}")
+                    self.error.emit((RuntimeError, err_msg, None))
+                else:
+                    self.progress.emit(
+                        "No valid download commands to execute. Task finished."
+                    )
+                    self.completed.emit()
+                return
+
+            total_depots = len(commands)
+            self.total_download_size_for_this_job = sum(depot_sizes)
+            self.actual_download_bytes_for_this_job = 0
+            self.actual_uncompressed_bytes_for_this_job = 0
+            self.completed_so_far_for_this_job = 0
+
+            logger.info(
+                f"Task tracking total download size: {self.total_download_size_for_this_job} bytes"
+            )
+
+            # Track sidecar writes across all depots — determines DD_DELTA vs DD_FULL
+            _sidecar_written_count = 0
+            failed_depots = []
+
+            for i, current_cmd in enumerate(commands):
+                if not self._is_running:
+                    logger.info("Download task stopping before next depot.")
+                    break
+
+                try:
+                    depot_id = current_cmd[current_cmd.index("-depot") + 1]
+                except (ValueError, IndexError):
+                    depot_id = f"depot_{i}"
+                self.current_depot_size = depot_sizes[i]
+
+                self.progress.emit(
+                    f"--- Starting download for depot {depot_id} "
+                    f"({i + 1}/{total_depots}) [Size: {self.current_depot_size} bytes] ---"
+                )
+                self.last_percentage = -1
+                self._current_depot_key_denied = False
+                self._current_depot_error_reason = ""
+                self._current_depot_zero_downloaded = False
+                self._current_depot_downloaded_bytes = 0
+                self._current_depot_uncompressed_bytes = 0
+                self._current_depot_errors = 0
+                depot_start_time = time.time()
+
+                # Determine creation flags for Windows to hide the console window
+                creation_flags = 0
+                if sys.platform == "win32":
+                    creation_flags = subprocess.CREATE_NO_WINDOW
+
+                # Use binary mode to handle \r correctly
+                self.process = subprocess.Popen(
+                    current_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=False,  # Binary mode
+                    creationflags=creation_flags,
+                    env=get_dotnet_env(),
+                )
+
+                # Read output directly in this thread
+                self._read_process_output()
+
+                # Close the stdout pipe now that the reader loop has exited.
+                # The process is either finished or about to be killed — releasing
+                # the read end of the pipe here frees the OS file descriptor
+                # immediately rather than waiting for GC.
+                if self.process and self.process.stdout:
+                    try:
+                        self.process.stdout.close()
+                    except OSError:
+                        pass
+
+                # Flush any remaining logs
+                self._flush_log_buffer()
+
+                if not self._is_running:
+                    if self.process and self.process.poll() is None:
+                        self.process.terminate()
+                    logger.info("Download task stopping because stop() was called.")
+                    self.completed.emit()
+                    return
+
+                return_code = 0
+                if self.process:
+                    return_code = self.process.poll()
+                    self.process = None
+
+                # Automatic LanCache fallback: if LanCache was used and failed, retry directly
+                if return_code != 0 and "-use-lancache" in current_cmd and self._is_running:
+                    fallback_msg = (
+                        f"⚠️ LanCache download issue encountered for depot {depot_id} (exit code {return_code}). "
+                        "Automatically falling back to direct connection without LanCache..."
+                    )
+                    self.progress.emit(fallback_msg)
+                    logger.warning(fallback_msg)
+
+                    fallback_cmd = [arg for arg in current_cmd if arg != "-use-lancache"]
+                    self.last_percentage = -1
+                    self._is_validating = False
+                    self._lancache_error_detected = False
+                    self._current_depot_downloaded_bytes = 0
+                    self._current_depot_uncompressed_bytes = 0
+
+                    self.process = subprocess.Popen(
+                        fallback_cmd,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT,
+                        text=False,
+                        creationflags=creation_flags,
+                        env=get_dotnet_env(),
+                    )
+                    self._read_process_output()
+
+                    if self.process and self.process.stdout:
+                        try:
+                            self.process.stdout.close()
+                        except OSError:
+                            pass
+
+                    self._flush_log_buffer()
+
+                    if not self._is_running:
+                        if self.process and self.process.poll() is None:
+                            self.process.terminate()
+                        logger.info("Download task stopping because stop() was called.")
+                        self.completed.emit()
+                        return
+
+                    if self.process:
+                        return_code = self.process.poll()
+                        self.process = None
+
+                # Check if DepotDownloader failed with key authorization error or 0 bytes downloaded
+                if return_code == 0 and (self._current_depot_key_denied or self._current_depot_zero_downloaded):
+                    return_code = 1
+                    if not self._current_depot_error_reason:
+                        self._current_depot_error_reason = "No valid decryption key (AccessDenied) or 0 bytes downloaded"
+                    logger.error(
+                        f"[DownloadDepotsTask] Depot {depot_id} failed download: {self._current_depot_error_reason}"
+                    )
+
+                if return_code != 0 and self._is_running:
+                    if self._current_depot_key_denied:
+                        error_msg = (
+                            f"Download aborted: No valid decryption key for depot {depot_id}. "
+                            f"{self._current_depot_error_reason or 'AccessDenied from Steam'}"
+                        )
+                        self.progress.emit(f"ERROR: {error_msg}")
+                        logger.error(f"[DownloadDepotsTask] {error_msg}")
+                        self._cleanup_temp_files()
+                        self.error.emit((RuntimeError, error_msg, None))
+                        return
+
+                    # Attempt smart recovery via wudrm / Steam CDN with fallbacks
+                    try:
+                        manifest_idx = current_cmd.index("-manifest")
+                        cur_manifest_id = current_cmd[manifest_idx + 1]
+                        mf_idx = current_cmd.index("-manifestfile")
+                        cur_manifest_file_path = current_cmd[mf_idx + 1]
+                    except (ValueError, IndexError):
+                        cur_manifest_id = None
+                        cur_manifest_file_path = None
+
+                    recovered_manifest = False
+                    if cur_manifest_id and cur_manifest_file_path:
+                        rec_msg = (
+                            f"⚠️ DepotDownloader failed for depot {depot_id} (exit code {return_code}). "
+                            f"Suspecting corrupted/poisoned manifest. Attempting fresh recovery via wudrm (Steam CDN)..."
+                        )
+                        self.progress.emit(rec_msg)
+                        logger.warning(rec_msg)
+
+                        # Purge suspected bad manifest from disk
+                        for bad_p in [
+                            cur_manifest_file_path,
+                            cur_manifest_file_path + ".sha",
+                            os.path.join(self.download_dir, ".DepotDownloader", f"{depot_id}_{cur_manifest_id}.manifest"),
+                            os.path.join(self.download_dir, ".DepotDownloader", f"{depot_id}_{cur_manifest_id}.manifest.sha"),
+                        ]:
+                            try:
+                                if os.path.exists(bad_p):
+                                    os.remove(bad_p)
+                            except OSError:
+                                pass
+
+                        try:
+                            from core import morrenus_api
+                            depots_map = game_data.get("depots", {})
+                            d_info = depots_map.get(str(depot_id)) or depots_map.get(int(depot_id)) or {}
+                            d_key = d_info.get("key") if isinstance(d_info, dict) else None
+                            if not d_key:
+                                from managers.depot_key_manager import DepotKeyManager
+                                d_key = DepotKeyManager().get_depot_keys(str(game_data.get("appid", ""))).get(str(depot_id))
+
+                            raw_bytes, gen_err = morrenus_api.generate_single_manifest(
+                                depot_id, cur_manifest_id, depot_key=d_key
+                            )
+                            if raw_bytes:
+                                from utils.manifest_resolver import sanitize_manifest_bytes, is_valid_manifest
+                                clean_bytes = sanitize_manifest_bytes(raw_bytes)
+                                if is_valid_manifest(clean_bytes):
+                                    os.makedirs(os.path.dirname(cur_manifest_file_path), exist_ok=True)
+                                    with open(cur_manifest_file_path, "wb") as mf:
+                                        mf.write(clean_bytes)
+                                    recovered_manifest = True
+                                    self.progress.emit(f"✅ Successfully re-fetched clean manifest for depot {depot_id} via wudrm/Steam CDN. Retrying download...")
+                                    logger.info(f"[DownloadDepotsTask] Re-fetched clean manifest for depot {depot_id} ({len(clean_bytes)} bytes)")
+                                else:
+                                    logger.error(f"[DownloadDepotsTask] Re-fetched manifest for depot {depot_id} is invalid.")
+                            else:
+                                logger.error(f"[DownloadDepotsTask] wudrm manifest recovery failed for depot {depot_id}: {gen_err}")
+                        except Exception as _rec_e:
+                            logger.error(f"[DownloadDepotsTask] Error during wudrm manifest recovery: {_rec_e}")
+
+                    if recovered_manifest and self._is_running:
+                        self.last_percentage = -1
+                        self._is_validating = False
+                        self._current_depot_downloaded_bytes = 0
+                        self._current_depot_uncompressed_bytes = 0
+                        retry_cmd = [arg for arg in current_cmd if arg != "-use-lancache"]
+                        self.process = subprocess.Popen(
+                            retry_cmd,
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT,
+                            text=False,
+                            creationflags=creation_flags,
+                            env=get_dotnet_env(),
+                        )
+                        self._read_process_output()
+
+                        if self.process and self.process.stdout:
+                            try:
+                                self.process.stdout.close()
+                            except OSError:
+                                pass
+
+                        self._flush_log_buffer()
+
+                        if not self._is_running:
+                            if self.process and self.process.poll() is None:
+                                self.process.terminate()
+                            logger.info("Download task stopping because stop() was called.")
+                            self.completed.emit()
+                            return
+
+                        if self.process:
+                            return_code = self.process.poll()
+                            self.process = None
+
+                        if return_code == 0 and (self._current_depot_key_denied or self._current_depot_zero_downloaded):
+                            return_code = 1
+                            if not self._current_depot_error_reason:
+                                self._current_depot_error_reason = "No valid decryption key (AccessDenied) or 0 bytes downloaded"
+
+                    if return_code != 0:
+                        if self._current_depot_key_denied:
+                            error_msg = (
+                                f"Download aborted: No valid decryption key for depot {depot_id}. "
+                                f"{self._current_depot_error_reason or 'AccessDenied from Steam'}"
+                            )
+                        elif self._current_depot_zero_downloaded and self.current_depot_size > 0:
+                            error_msg = (
+                                f"Download aborted: 0 bytes downloaded for depot {depot_id} "
+                                f"(expected {self.current_depot_size} bytes)."
+                            )
+                        else:
+                            error_msg = (
+                                f"Poisoned manifest files: Depot {depot_id} (Manifest {cur_manifest_id or 'unknown'}) failed verification "
+                                f"and could not be recovered via wudrm or Steam CDN. Aborting."
+                            )
+                        self.progress.emit(f"ERROR: {error_msg}")
+                        logger.error(f"[DownloadDepotsTask] {error_msg}")
+                        self._cleanup_temp_files()
+                        self.error.emit((RuntimeError, error_msg, None))
+                        return
+                else:
+                    self.completed_so_far_for_this_job += self.current_depot_size
+                    self.actual_download_bytes_for_this_job += self._current_depot_downloaded_bytes
+                    self.actual_uncompressed_bytes_for_this_job += self._current_depot_uncompressed_bytes
+                    # Auto-tune: learn from this depot, adjust the rest (if enabled).
+                    # Validation-only depots (no wire bytes) hold N without
+                    # training: local checksum throughput must never become
+                    # the network baseline.
+                    if self._auto_enabled:
+                        try:
+                            from utils import auto_tune as _auto_tune
+                            used_n = _auto_tune.get_cmd_concurrency(current_cmd, self._auto_cap)
+                            wire_bytes = self._current_depot_downloaded_bytes
+                            if not _auto_tune.should_learn(wire_bytes):
+                                logger.debug(
+                                    f"[DownloadDepotsTask] Auto-tune: depot {depot_id} "
+                                    f"moved {wire_bytes} wire bytes — validation-only, holding N={used_n}"
+                                )
+                                self.progress.emit(
+                                    f"Auto-tune: depot {depot_id} validation-only, holding at "
+                                    f"{used_n} (cap {self._auto_cap})."
+                                )
+                            else:
+                                elapsed = max(0.0, time.time() - depot_start_time)
+                                speed_bps = self._smooth_speed_bps
+                                if speed_bps <= _auto_tune.SPEED_EPS_BPS and elapsed > 0 and wire_bytes > 0:
+                                    speed_bps = wire_bytes / elapsed
+                                next_n = _auto_tune.record_result(
+                                    get_settings(),
+                                    self._auto_best_key,
+                                    used_n,
+                                    float(speed_bps),
+                                    self._auto_cap,
+                                    self._current_depot_errors,
+                                )
+                                for _later_cmd in commands[i + 1:]:
+                                    _auto_tune.set_cmd_concurrency(_later_cmd, next_n)
+                                self.progress.emit(
+                                    f"Auto-tune: depot {depot_id} @ {_auto_tune.format_speed(speed_bps)} "
+                                    f"with {used_n} chunks → next: {next_n} (cap {self._auto_cap})."
+                                )
+                                logger.info(
+                                    f"[DownloadDepotsTask] Auto-tune: depot {depot_id} "
+                                    f"{speed_bps:.0f} B/s N={used_n} errors={self._current_depot_errors} → N={next_n}"
+                                )
+                        except Exception as _at_err:
+                            logger.debug(f"[DownloadDepotsTask] Auto-tune step failed: {_at_err}")
+                    self._current_depot_downloaded_bytes = 0
+                    self._current_depot_uncompressed_bytes = 0
+                    self._last_speed_calc_time = 0.0
+                    self._smooth_speed_bps = 0.0
+                    # Copy manifest and create .sha sidecar in .DepotDownloader to enable future delta updates
+                    try:
+                        # Safely extract manifest_id and manifest_file_path via flag names
+                        manifest_idx = current_cmd.index("-manifest")
+                        manifest_id = current_cmd[manifest_idx + 1]
+                        mf_idx = current_cmd.index("-manifestfile")
+                        manifest_file_path = current_cmd[mf_idx + 1]
+
+                        dest_depot_downloader = os.path.join(self.download_dir, ".DepotDownloader")
+                        os.makedirs(dest_depot_downloader, exist_ok=True)
+
+                        dest_manifest_path = os.path.join(dest_depot_downloader, f"{depot_id}_{manifest_id}.manifest")
+
+                        if os.path.exists(manifest_file_path):
+                            try:
+                                from utils.manifest_resolver import sanitize_manifest_file
+                                sanitize_manifest_file(manifest_file_path)
+                            except Exception:
+                                pass
+                            shutil.copy2(manifest_file_path, dest_manifest_path)
+
+                            # Calculate SHA1 hash of the manifest file
+                            sha1 = hashlib.sha1()
+                            with open(dest_manifest_path, "rb") as f:
+                                while chunk := f.read(8192):
+                                    sha1.update(chunk)
+
+                            # Write the raw bytes of the SHA1 hash to the .sha file (as expected by DDM's Util.LoadManifestFromFile)
+                            with open(dest_manifest_path + ".sha", "wb") as f:
+                                f.write(sha1.digest())
+
+                            _sidecar_written_count += 1
+                            logger.info(f"Successfully copied manifest and created SHA sidecar for depot {depot_id} to enable delta patching.")
+
+                            try:
+                                from utils.manifest_resolver import restore_depot_symlinks
+                                restored_symlinks = restore_depot_symlinks(dest_manifest_path, self.download_dir)
+                                if restored_symlinks:
+                                    logger.info(f"Restored {len(restored_symlinks)} symlinks for depot {depot_id}")
+                            except Exception as e:
+                                logger.debug(f"Failed restoring symlinks for depot {depot_id}: {e}")
+                        else:
+                            logger.warning(f"Manifest file not found at {manifest_file_path}, skipping delta manifest setup.")
+                    except Exception as e:
+                        logger.warning(f"Failed to copy manifest for depot {depot_id}: {e}", exc_info=True)
+
+            if skipped_depots:
+                self.progress.emit(
+                    f"Skipped {len(skipped_depots)} depots due to missing manifests: "
+                    f"{', '.join(skipped_depots)}"
+                )
+                if len(skipped_depots) == total_depots:
+                    error_msg = "Download aborted: all depots were skipped due to missing manifests."
+                    self.progress.emit(f"ERROR: {error_msg}")
+                    logger.error(error_msg)
+                    self._cleanup_temp_files()
+                    self.error.emit((RuntimeError, error_msg, None))
+                    return
+
+            if failed_depots:
+                err_summary = ", ".join(f"depot {d} (code {c})" for d, c in failed_depots)
+                error_msg = f"DepotDownloader failed for {len(failed_depots)} depot(s): {err_summary}"
+                self.progress.emit(f"ERROR: {error_msg}")
+                logger.error(error_msg)
+                self._cleanup_temp_files()
+                self.error.emit((RuntimeError, error_msg, None))
+                return
+
+            if not self._is_running:
+                logger.info("Download task stopped before cleanup.")
+                self.completed.emit()
+                return
+
+            self._copy_manifests_to_steam_depotcache()
+            self._cleanup_temp_files()
+
+            self.completed.emit()
+
+        except FileNotFoundError:
+            binary = "executable"
+            if current_cmd:
+                binary = current_cmd[0]
+
+            error_msg = (
+                f"ERROR: '{binary}' command not found. "
+                "Ensure .NET Runtime is installed and 'dotnet' is in your PATH."
+            )
+            self.progress.emit(error_msg)
+            logger.critical(f"'{binary}' not found.")
+            self.error.emit((FileNotFoundError, f"'{binary}' not found", None))
+            raise
+
+        except (OSError, subprocess.SubprocessError) as e:
+            self.progress.emit(f"An unexpected error occurred during download: {e}")
+            logger.error(f"Download subprocess failed: {e}", exc_info=True)
+            self.process = None
+            self.error.emit((type(e), str(e), None))
+            raise
+    def _read_process_output(self):
+        """Reads process output in chunks, splitting on \\r and \\n for progress updates."""
+        if not self.process or not self.process.stdout:
+            return
+
+        buffer = bytearray()
+        while self._is_running:
+            if self.process is None:
+                break
+
+            # Read in chunks to avoid one syscall per byte
+            try:
+                chunk = self.process.stdout.read1(4096)
+            except (OSError, AttributeError):
+                try:
+                    chunk = self.process.stdout.read(4096)
+                except OSError:
+                    break
+
+            if not chunk:
+                if self.process and self.process.poll() is not None:
+                    break
+                time.sleep(0.01)
+                continue
+
+            for byte in chunk:
+                b = bytes([byte])
+                if b == b"\r" or b == b"\n":
+                    if buffer:
+                        try:
+                            line = buffer.decode("utf-8", errors="replace")
+                            self._handle_downloader_output(line)
+                        except UnicodeDecodeError:
+                            pass
+                        buffer.clear()
+                else:
+                    buffer.extend(b)
+
+        # Process remaining buffer
+        if buffer:
+            try:
+                line = buffer.decode("utf-8", errors="replace")
+                self._handle_downloader_output(line)
+            except UnicodeDecodeError:
+                pass
+
+    def _copy_manifests_to_steam_depotcache(self):
+        """Copy downloaded manifests to Steam's central depotcache for native ACF creation via SLSsteam.
+
+        Must be called BEFORE _cleanup_temp_files() because cleanup deletes
+        /tmp/mistwalker_manifests/.  Without these manifests in Steam's depotcache,
+        the install|appid|index API command cannot verify local files and Steam
+        falls back to 'needs download' state (blue Install button).
+        """
+        try:
+            from utils.slssteam_integration import _experimental_mode_enabled
+            if not _experimental_mode_enabled():
+                return
+        except Exception:
+            return
+
+        from core.steam_helpers import find_steam_install
+        temp_manifest_dir = os.path.join(tempfile.gettempdir(), "mistwalker_manifests")
+        if not os.path.exists(temp_manifest_dir):
+            return
+
+        steam_path = find_steam_install()
+        if not steam_path:
+            return
+
+        central_depotcache_dir = os.path.join(steam_path, "depotcache")
+        try:
+            os.makedirs(central_depotcache_dir, exist_ok=True)
+        except Exception as e:
+            logger.error(f"Failed to create central depotcache directory: {e}")
+            return
+
+        try:
+            from utils.manifest_resolver import sanitize_manifest_file
+            for fname in os.listdir(temp_manifest_dir):
+                if fname.endswith(".manifest"):
+                    src = os.path.join(temp_manifest_dir, fname)
+                    try:
+                        sanitize_manifest_file(src)
+                    except Exception:
+                        pass
+                    dst = os.path.join(central_depotcache_dir, fname)
+                    shutil.copy2(src, dst)
+                    logger.info(f"Copied manifest {fname} to Steam's central depotcache")
+        except Exception as e:
+            logger.error(f"Failed to copy manifests to central depotcache: {e}")
+
+    def _cleanup_temp_files(self):
+        """Cleans up temporary files created during the download process."""
+        self.progress.emit("--- Cleaning up temporary files ---")
+        temp_dir = tempfile.gettempdir()
+        items_to_clean = {
+            "mistwalker_keys.vdf": os.path.join(temp_dir, "mistwalker_keys.vdf"),
+            "mistwalker_manifests": os.path.join(temp_dir, "mistwalker_manifests"),
+        }
+
+        for name, path in items_to_clean.items():
+            if os.path.exists(path):
+                try:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                        self.progress.emit(f"Removed temp directory '{name}'.")
+                    else:
+                        os.remove(path)
+                        self.progress.emit(f"Removed temp file '{name}'.")
+                except OSError as e:
+                    self.progress.emit(f"Error removing temp item '{name}': {e}")
+
+        if self.temp_file_list and os.path.exists(self.temp_file_list):
+            try:
+                os.remove(self.temp_file_list)
+                self.progress.emit("Removed temporary selective filelist.")
+                self.temp_file_list = None
+            except OSError as e:
+                self.progress.emit(f"Error removing selective filelist temp file: {e}")
+
+    def _flush_log_buffer(self):
+        """Emits any buffered log lines."""
+        if self._log_buffer:
+            # Join buffered lines and emit as a single signal
+            # This reduces the number of signals sent to the main thread
+            combined_log = "\n".join(self._log_buffer)
+            self.progress.emit(combined_log)
+            self._log_buffer.clear()
+            self._last_log_time = time.time()
+
+    def _handle_downloader_output(self, line: str):
+        """Parses output lines from the downloader to update progress."""
+        if not self._is_running:
+            return
+
+        line = line.strip()
+        if not line:
+            return
+
+        # Add to buffer
+        self._log_buffer.append(line)
+
+        # Check for LanCache CDN error lines
+        if "Got CDN auth token=" in line and "result: Fail" in line:
+            self._lancache_error_detected = True
+
+        # Check for depot key denial / authorization errors
+        lower_line = line.lower()
+        if "no valid depot key" in lower_line or ("depot key" in lower_line and "accessdenied" in lower_line) or "result: accessdenied" in lower_line:
+            self._current_depot_key_denied = True
+            self._current_depot_error_reason = line
+        # Count chunk-level trouble for the auto-tune controller (back off fast).
+        if (
+            "failed to download chunk" in lower_line
+            or "encountered error downloading chunk" in lower_line
+            or "encountered unexpected error downloading chunk" in lower_line
+            or "connection timeout downloading chunk" in lower_line
+            or "failed to retrieve any download servers" in lower_line
+            or "failed to find any server with chunk" in lower_line
+        ):
+            self._current_depot_errors += 1
+        if "total downloaded:" in lower_line:
+            if "from 0 depots" in lower_line and "0 bytes" in lower_line:
+                self._current_depot_zero_downloaded = True
+            m_wire = re.search(r"total downloaded:\s*(\d+)\s*bytes", lower_line)
+            if m_wire:
+                self._current_depot_downloaded_bytes = int(m_wire.group(1))
+            m_uncomp = re.search(r"\(\s*(\d+)\s*bytes uncompressed\)", lower_line)
+            if m_uncomp:
+                self._current_depot_uncompressed_bytes = int(m_uncomp.group(1))
+
+        # Check validation phase vs real chunk download
+        is_validation_line = line.startswith("Validating ") or line.startswith("Checking ")
+        if is_validation_line:
+            self._is_validating = True
+            current_time = time.time()
+            if current_time - self._last_speed_calc_time >= 1.0:
+                self._last_speed_calc_time = current_time
+                self._smooth_speed_bps = 0.0
+                self.speed_update.emit("Validating local files... | ETA: Calculating...")
+
+        # Check for percentage update
+        match = self.percentage_regex.search(line)
+        if match:
+            self._is_validating = False
+            try:
+                percentage = float(match.group(1))
+                current_time = time.time()
+
+                if self.total_download_size_for_this_job > 0:
+                    progress_of_current_depot = (
+                        percentage / 100.0
+                    ) * self.current_depot_size
+
+                    total_progress_bytes = (
+                        self.completed_so_far_for_this_job + progress_of_current_depot
+                    )
+
+                    total_percentage = int(
+                        (total_progress_bytes / self.total_download_size_for_this_job)
+                        * 100
+                    )
+
+                    total_percentage = max(0, min(100, total_percentage))
+
+                    if total_percentage != self.last_percentage:
+                        self.progress_percentage.emit(total_percentage)
+                        self.last_percentage = total_percentage
+
+                    # Real network chunk downloading phase
+                    if self._last_speed_calc_time == 0.0:
+                        self._last_speed_calc_time = current_time
+                        self._last_downloaded_bytes = total_progress_bytes
+                        self.speed_update.emit("Speed: 0.00 B/s | ETA: Calculating...")
+                    elif current_time - self._last_speed_calc_time >= 1.0:
+                        elapsed = current_time - self._last_speed_calc_time
+                        bytes_diff = total_progress_bytes - self._last_downloaded_bytes
+                        self._last_downloaded_bytes = total_progress_bytes
+                        self._last_speed_calc_time = current_time
+
+                        # Guard against negative diffs (e.g. depot switch or validation transition)
+                        if bytes_diff < 0:
+                            bytes_diff = 0.0
+
+                        inst_speed_bps = bytes_diff / elapsed
+
+                        # Exponential moving average for smooth speed display (alpha = 0.35)
+                        if self._smooth_speed_bps == 0.0:
+                            self._smooth_speed_bps = inst_speed_bps
+                        else:
+                            self._smooth_speed_bps = 0.35 * inst_speed_bps + 0.65 * self._smooth_speed_bps
+
+                        speed_bps = self._smooth_speed_bps
+                        remaining_bytes = max(0.0, float(self.total_download_size_for_this_job - total_progress_bytes))
+
+                        # Format Speed
+                        if speed_bps < 1024:
+                            speed_str = f"{speed_bps:.2f} B/s"
+                        elif speed_bps < 1024**2:
+                            speed_str = f"{(speed_bps / 1024):.2f} KB/s"
+                        else:
+                            speed_str = f"{(speed_bps / (1024**2)):.2f} MB/s"
+
+                        # Format ETA (always included, never hidden)
+                        if speed_bps > 1024:  # At least 1 KB/s to give meaningful ETA
+                            eta_seconds = int(remaining_bytes / speed_bps)
+                            if eta_seconds < 60:
+                                eta_str = f"{eta_seconds}s remaining"
+                            elif eta_seconds < 3600:
+                                eta_str = f"{eta_seconds // 60}m {eta_seconds % 60}s remaining"
+                            else:
+                                eta_str = f"{eta_seconds // 3600}h {(eta_seconds % 3600) // 60}m remaining"
+                        else:
+                            eta_str = "Calculating..."
+
+                        speed_display = f"Speed: {speed_str} | ETA: {eta_str}"
+                        self.speed_update.emit(speed_display)
+                        logger.debug(f"Download Progress: {total_percentage}% | {speed_display} | Completed: {total_progress_bytes:.0f} bytes")
+                else:
+                    # Fallback when total download size is unannounced
+                    int_percentage = int(percentage)
+                    if int_percentage != self.last_percentage:
+                        self.progress_percentage.emit(int_percentage)
+                        self.last_percentage = int_percentage
+
+                    if self._last_speed_calc_time == 0.0:
+                        self._last_speed_calc_time = current_time
+                        self._last_downloaded_bytes = percentage
+                        self.speed_update.emit("Downloading game files... | ETA: Calculating...")
+                    elif current_time - self._last_speed_calc_time >= 1.0:
+                        elapsed = current_time - self._last_speed_calc_time
+                        pct_diff = percentage - self._last_downloaded_bytes
+                        self._last_downloaded_bytes = percentage
+                        self._last_speed_calc_time = current_time
+
+                        if pct_diff > 0:
+                            pct_per_sec = pct_diff / elapsed
+                            remaining_pct = max(0.0, 100.0 - percentage)
+                            eta_seconds = int(remaining_pct / pct_per_sec) if pct_per_sec > 0 else 0
+                            if eta_seconds < 60:
+                                eta_str = f"{eta_seconds}s remaining"
+                            elif eta_seconds < 3600:
+                                eta_str = f"{eta_seconds // 60}m {eta_seconds % 60}s remaining"
+                            else:
+                                eta_str = f"{eta_seconds // 3600}h {(eta_seconds % 3600) // 60}m remaining"
+                        else:
+                            eta_str = "Calculating..."
+
+                        self.speed_update.emit(f"Downloading... ({percentage:.1f}%) | ETA: {eta_str}")
+            except ValueError:
+                pass
+
+        # Check if we should flush the buffer
+        is_important = "error" in line.lower() or "warning" in line.lower()
+        current_time = time.time()
+
+        # Flush if important message or time interval passed (80ms)
+        if is_important or (current_time - self._last_log_time > 0.08):
+            self._flush_log_buffer()
+
+    def _prepare_downloads(
+        self,
+        game_data: Dict[str, Any],
+        selected_depots: List[str],
+        dest_path: str,
+        max_downloads: Optional[int] = None,
+    ) -> Tuple[List[List[str]], List[str], List[int]]:
+        """
+        Prepares the list of commands, identifies skipped depots, and gathers sizes.
+        """
+        temp_dir = tempfile.gettempdir()
+        keys_path = os.path.join(temp_dir, "mistwalker_keys.vdf")
+        manifest_dir = os.path.join(temp_dir, "mistwalker_manifests")
+
+        self.progress.emit(f"Generating depot keys file at {keys_path}")
+        appid_str = str(game_data.get("appid", ""))
+        cached_dkm_keys = None
+
+        with open(keys_path, "w") as f:
+            # Depot decryption keys in a world-readable /tmp file. Create it
+            # owner-only from the start rather than widening then narrowing.
+            try:
+                os.chmod(keys_path, 0o600)
+            except OSError:
+                pass
+            for depot_id in selected_depots:
+                depots_map = game_data.get("depots", {})
+                depot_info = depots_map.get(str(depot_id))
+                if depot_info is None and str(depot_id).isdigit():
+                    depot_info = depots_map.get(int(depot_id))
+                if not isinstance(depot_info, dict):
+                    depot_info = {}
+
+                key = depot_info.get("key")
+
+                # Fallback 1: query DepotKeyManager directly if key is missing from in-memory game_data
+                if not key and appid_str:
+                    try:
+                        if cached_dkm_keys is None:
+                            from managers.depot_key_manager import DepotKeyManager
+                            cached_dkm_keys = DepotKeyManager().get_depot_keys(appid_str) or {}
+                        key = cached_dkm_keys.get(str(depot_id))
+                        if key:
+                            logger.info(
+                                f"[DownloadDepotsTask] Recovered missing key for depot {depot_id} "
+                                f"from DepotKeyManager"
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            f"[DownloadDepotsTask] Failed to query DepotKeyManager for depot {depot_id}: {e}"
+                        )
+
+                # Fallback 2: If key is still missing, attempt live Hubcap API bundle download to extract fresh keys
+                if not key and appid_str:
+                    try:
+                        self.progress.emit(f"Fetching fresh decryption key for depot {depot_id} via Hubcap...")
+                        from core import morrenus_api
+                        zip_res, z_err = morrenus_api.download_manifest(appid_str, force_update=True)
+                        if zip_res and os.path.exists(zip_res):
+                            import zipfile
+                            recovered_keys = {}
+                            with zipfile.ZipFile(zip_res, "r") as zf:
+                                for name in zf.namelist():
+                                    if name.endswith(".lua"):
+                                        lua_txt = zf.read(name).decode("utf-8", errors="ignore")
+                                        for m in iter_live_matches(lua_txt, r'addappid\((\d+),\s*\d+,\s*["\']([a-fA-F0-9]{64})["\']\)'):
+                                            if m.group(1) != str(appid_str):
+                                                recovered_keys[m.group(1)] = m.group(2)
+                            if recovered_keys:
+                                from managers.depot_key_manager import DepotKeyManager
+                                DepotKeyManager().save_depot_keys(appid_str, recovered_keys)
+                                cached_dkm_keys = DepotKeyManager().get_depot_keys(appid_str) or {}
+                                key = recovered_keys.get(str(depot_id))
+                                if key:
+                                    logger.info(f"[DownloadDepotsTask] Recovered fresh key for depot {depot_id} via live Hubcap bundle")
+                                    self.progress.emit(f"Successfully recovered decryption key for depot {depot_id}")
+                    except Exception as fetch_err:
+                        logger.warning(f"[DownloadDepotsTask] Failed live key fetch for depot {depot_id}: {fetch_err}")
+
+                if key:
+                    f.write(f"{depot_id};{key}\n")
+                else:
+                    logger.warning(
+                        f"[DownloadDepotsTask] No decryption key available for depot {depot_id}"
+                    )
+                    self.progress.emit(
+                        f"Warning: No decryption key found for depot {depot_id}. Download may fail or be skipped."
+                    )
+
+        from utils.steam_manifest import get_install_folder_name
+        install_folder_name = get_install_folder_name(game_data)
+
+        download_dir = os.path.join(
+            dest_path, "steamapps", "common", install_folder_name
+        )
+        self.download_dir = download_dir
+        os.makedirs(download_dir, exist_ok=True)
+        self.progress.emit(f"Download destination set to: {download_dir}")
+
+        # Use dotnet to run the .NET 9 DLL (multiplatform, like Steamless)
+        # Get the full path to dotnet, checking both PATH and default install location
+        dotnet_path = get_dotnet_path()
+        if not dotnet_path:
+            raise RuntimeError(
+                "dotnet command not found. Please install .NET 9 runtime manually."
+            )
+        dotnet_cmd = dotnet_path
+        dll_path = resource_path(os.path.join("deps", "DepotDownloader.dll"))
+
+        # Get max downloads from settings (slider = exact value when
+        # auto-tune is off, cap when auto-tune is on).
+        settings = get_settings()
+        from utils import auto_tune as _auto_tune
+
+        self._auto_cap = _auto_tune.get_cap(settings, "max_downloads", 8)
+        self._auto_enabled = _auto_tune.is_auto_enabled(settings, "auto_max_downloads")
+        self._auto_best_key = "auto_tune_best"
+        if max_downloads is not None:
+            if max_downloads < 1:
+                raise ValueError("max_downloads must be at least 1")
+            self._auto_enabled = False
+            self._auto_cap = max_downloads
+            self.progress.emit(
+                f"Download concurrency: {max_downloads} concurrent chunks."
+            )
+        elif self._auto_enabled:
+            max_downloads = _auto_tune.get_start_concurrency(
+                settings,
+                cap_key="max_downloads",
+                auto_key="auto_max_downloads",
+                best_key=self._auto_best_key,
+                default_start=8,
+                default_cap=8,
+            )
+            self.progress.emit(
+                f"Auto-tune ON: starting at {max_downloads} concurrent chunks "
+                f"(cap {self._auto_cap})."
+            )
+            logger.info(
+                f"[DownloadDepotsTask] Auto-tune enabled: start N={max_downloads} cap={self._auto_cap}"
+            )
+        else:
+            max_downloads = self._auto_cap
+
+        commands = []
+        skipped_depots = []
+        depot_sizes = []
+
+        for depot_id in selected_depots:
+            depot_id_str = str(depot_id)
+            manifest_id = game_data.get("manifests", {}).get(depot_id_str)
+            if not manifest_id and depot_id_str.isdigit():
+                manifest_id = game_data.get("manifests", {}).get(int(depot_id_str))
+
+            # Fallback 1: check metadata manifest_overrides
+            if not manifest_id:
+                manifest_id = (game_data.get("manifest_overrides") or {}).get(depot_id_str)
+
+            # Fallback 2: check if any {depot_id}_*.manifest exists on disk (manifest_dir, base manifests, depotcache)
+            if not manifest_id:
+                for search_dir in [
+                    manifest_dir,
+                    os.path.join(get_base_path(), "manifests"),
+                    os.path.join(dest_path, "depotcache"),
+                ]:
+                    if os.path.exists(search_dir):
+                        try:
+                            for fn in os.listdir(search_dir):
+                                if fn.startswith(f"{depot_id_str}_") and fn.endswith(".manifest"):
+                                    parts = fn[:-len(".manifest")].split("_")
+                                    if len(parts) == 2 and parts[1].isdigit():
+                                        manifest_id = parts[1]
+                                        logger.info(
+                                            f"[DownloadDepotsTask] Recovered manifest ID {manifest_id} for depot {depot_id_str} from disk ({fn})"
+                                        )
+                                        break
+                        except Exception as _disc_err:
+                            logger.debug(f"[DownloadDepotsTask] Error inspecting {search_dir}: {_disc_err}")
+                    if manifest_id:
+                        break
+
+            # Fallback 3: Live Steam PICS query for depot manifest GID
+            if not manifest_id and appid_str:
+                try:
+                    from core import steam_api
+                    app_depots = steam_api.get_app_depots(appid_str) or {}
+                    pics_depot_info = app_depots.get(depot_id_str)
+                    if not pics_depot_info and depot_id_str.isdigit():
+                        pics_depot_info = app_depots.get(int(depot_id_str))
+                    pics_depot_info = pics_depot_info or {}
+                    from utils.depot_utils import get_depot_manifest_gid
+                    manifest_id = get_depot_manifest_gid(pics_depot_info, branch=game_data.get("branch", "public"))
+                    if not manifest_id and depot_id_str:
+                        m_res = steam_api.get_manifest_id(appid_str, depot_id_str)
+                        if isinstance(m_res, dict) and m_res.get("success"):
+                            manifest_id = m_res.get("manifest_id")
+                    if manifest_id:
+                        logger.info(
+                            f"[DownloadDepotsTask] Recovered manifest ID {manifest_id} for depot {depot_id_str} from Steam PICS"
+                        )
+                except Exception as e:
+                    logger.warning(f"[DownloadDepotsTask] Failed Steam PICS lookup for depot {depot_id_str}: {e}")
+
+            if manifest_id:
+                game_data.setdefault("manifests", {})[depot_id_str] = str(manifest_id)
+            else:
+                self.progress.emit(
+                    f"Warning: No manifest ID for depot {depot_id}. Skipping."
+                )
+                skipped_depots.append(str(depot_id))
+                continue
+
+            manifest_file_path = os.path.join(
+                manifest_dir, f"{depot_id}_{manifest_id}.manifest"
+            )
+
+            # Fallback 1: check if the manifest exists in the library's local depotcache folder
+            if not os.path.exists(manifest_file_path) or os.path.getsize(manifest_file_path) == 0:
+                local_depotcache_path = os.path.join(dest_path, "depotcache", f"{depot_id}_{manifest_id}.manifest")
+                if os.path.exists(local_depotcache_path) and os.path.getsize(local_depotcache_path) > 0:
+                    try:
+                        import shutil
+                        os.makedirs(manifest_dir, exist_ok=True)
+                        shutil.copy(local_depotcache_path, manifest_file_path)
+                        self.progress.emit(f"Recovered manifest from local depotcache: {depot_id}_{manifest_id}.manifest")
+                    except Exception as e:
+                        self.progress.emit(f"Warning: Failed to copy local depotcache manifest: {e}")
+
+            # Fallback 2: if manifest is missing or empty, generate single manifest directly via at0-m/Hubcap
+            if not os.path.exists(manifest_file_path) or os.path.getsize(manifest_file_path) == 0:
+                self.progress.emit(f"Manifest file {os.path.basename(manifest_file_path)} is missing/invalid. Requesting manifest via at0-m (Steam CDN) / Hubcap...")
+                try:
+                    from core import morrenus_api
+                    depots_map = game_data.get("depots", {})
+                    d_info = depots_map.get(str(depot_id)) or depots_map.get(int(depot_id)) or {}
+                    depot_key = d_info.get("key") if isinstance(d_info, dict) else None
+                    manifest_bytes, gen_err = morrenus_api.generate_single_manifest(depot_id, manifest_id, depot_key=depot_key)
+                    if manifest_bytes:
+                        os.makedirs(os.path.dirname(manifest_file_path), exist_ok=True)
+                        with open(manifest_file_path, "wb") as mf:
+                            mf.write(manifest_bytes)
+                        self.progress.emit(f"Successfully generated single manifest: {os.path.basename(manifest_file_path)}")
+                    else:
+                        logger.warning(f"Single manifest generation failed ({gen_err}). Falling back to bundle download...")
+                        import zipfile
+                        app_id = appid_str
+                        target_branch = game_data.get("branch") or morrenus_api.get_selected_branch(app_id)
+                        fpath, err = morrenus_api.download_manifest(app_id, target_branch)
+                        if fpath and os.path.exists(fpath):
+                            with zipfile.ZipFile(fpath, "r") as zip_ref:
+                                for item_name in zip_ref.namelist():
+                                    if item_name.endswith(".manifest"):
+                                        dest_item_path = os.path.join(manifest_dir, os.path.basename(item_name))
+                                        with open(dest_item_path, "wb") as mf:
+                                            mf.write(zip_ref.read(item_name))
+                                        self.progress.emit(f"Successfully extracted fallback manifest: {os.path.basename(dest_item_path)}")
+                except Exception as e:
+                    self.progress.emit(f"Warning: Failed to fetch fallback manifest from Hubcap: {e}")
+
+            # Pre-download Sanity Check: Ensure valid non-empty manifest file exists on disk
+            from utils.manifest_resolver import sanitize_manifest_file, is_valid_manifest
+            try:
+                sanitize_manifest_file(manifest_file_path)
+            except Exception as _m_san_err:
+                logger.debug(f"[DownloadDepotsTask] Failed to sanitize manifest {manifest_file_path}: {_m_san_err}")
+
+            if not os.path.exists(manifest_file_path) or not is_valid_manifest(manifest_file_path):
+                # Try emergency wudrm recovery before giving up
+                emergency_ok = False
+                try:
+                    from core import morrenus_api
+                    depots_map = game_data.get("depots", {})
+                    d_info = depots_map.get(str(depot_id)) or depots_map.get(int(depot_id)) or {}
+                    d_key = d_info.get("key") if isinstance(d_info, dict) else None
+                    if not d_key and appid_str:
+                        from managers.depot_key_manager import DepotKeyManager
+                        d_key = DepotKeyManager().get_depot_keys(appid_str).get(str(depot_id))
+                    em_bytes, _ = morrenus_api.generate_single_manifest(depot_id, manifest_id, depot_key=d_key)
+                    if em_bytes:
+                        from utils.manifest_resolver import sanitize_manifest_bytes
+                        em_clean = sanitize_manifest_bytes(em_bytes)
+                        if is_valid_manifest(em_clean):
+                            os.makedirs(os.path.dirname(manifest_file_path), exist_ok=True)
+                            with open(manifest_file_path, "wb") as mf:
+                                mf.write(em_clean)
+                            emergency_ok = True
+                            self.progress.emit(f"Emergency recovered valid manifest for depot {depot_id} via wudrm/Steam CDN")
+                except Exception as _em_err:
+                    logger.debug(f"[DownloadDepotsTask] Emergency wudrm pre-check failed: {_em_err}")
+
+                if not emergency_ok:
+                    err_msg = (
+                        f"Poisoned manifest files: Depot {depot_id} (Manifest ID: {manifest_id}) "
+                        f"is corrupted or invalid and could not be recovered via wudrm or Steam CDN."
+                    )
+                    logger.error(f"[DownloadDepotsTask] {err_msg}")
+                    self.progress.emit(f"ERROR: {err_msg}")
+                    skipped_depots.append(str(depot_id))
+                    continue
+
+            cmd_args = [
+                dotnet_cmd,
+                dll_path,
+                "-app",
+                appid_str,
+                "-depot",
+                str(depot_id),
+                "-manifest",
+                str(manifest_id),
+                "-manifestfile",
+                manifest_file_path,
+                "-depotkeys",
+                keys_path,
+                "-max-downloads",
+                str(max_downloads),
+                "-dir",
+                download_dir,
+                "-validate",
+            ]
+
+            # Check selected branch (falls back to the installed ACF betakey, then public)
+            from core.morrenus_api import get_selected_branch
+            target_branch = game_data.get("branch") or get_selected_branch(appid_str)
+            if target_branch and target_branch != "public":
+                cmd_args.extend(["-branch", str(target_branch)])
+
+            # 1. LanCache support (configurable via settings; falls back to direct if LanCache fails)
+            use_lancache = settings.value("use_lancache", True, type=bool)
+            if use_lancache:
+                cmd_args.append("-use-lancache")
+
+            # 2. Adaptive CDN latency probe support (default enabled)
+            if settings.value("probe_cdn", True, type=bool):
+                cmd_args.append("-probe-cdn")
+
+            # 3. LoginID session isolation (randomized 32-bit integer)
+            login_id = random.randint(1, 2147483647)
+            cmd_args.extend(["-loginid", str(login_id)])
+
+            # 3. Selective files list support (-filelist)
+            selected_files = game_data.get("selected_files_list")
+            if selected_files:
+                # Write filelist to temp file
+                fl_path = os.path.join(temp_dir, f"selective_filelist_{depot_id}.txt")
+                try:
+                    with open(fl_path, "w", encoding="utf-8") as fl:
+                        for file_path in selected_files:
+                            # Normalize paths to use forward slashes for DDM
+                            fl.write(file_path.replace("\\", "/") + "\n")
+                    self.temp_file_list = fl_path
+                    cmd_args.extend(["-filelist", fl_path])
+                    self.progress.emit(f"Using selective filelist: {len(selected_files)} file(s) checked")
+                except OSError as e:
+                    self.progress.emit(f"Warning: Failed to write selective filelist: {e}")
+
+            # Size is resolved here (not earlier) so it stays 1:1 with `commands`:
+            # a depot skipped above must not leave a size behind, or every later
+            # depot would report the wrong size and inflate the job total.
+            try:
+                d_info = (game_data.get("depots") or {}).get(depot_id) or (game_data.get("depots") or {}).get(depot_id_str) or {}
+                size_str = d_info.get("size")
+                if size_str:
+                    depot_sizes.append(int(size_str))
+                else:
+                    depot_sizes.append(0)
+                    self.progress.emit(
+                        f"Warning: No size data for depot {depot_id}. "
+                        "Total progress may be inaccurate."
+                    )
+            except (ValueError, TypeError):
+                depot_sizes.append(0)
+                self.progress.emit(
+                    f"Warning: Invalid size data for depot {depot_id}. "
+                    "Total progress may be inaccurate."
+                )
+
+            commands.append(cmd_args)
+
+        return commands, skipped_depots, depot_sizes
+
+    def stop(self):
+        """Stop the current downloader process and prevent further depots."""
+        logger.debug("Stop signal received by download task.")
+        self._is_running = False
+        process = self.process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if psutil:
+                parent = psutil.Process(process.pid)
+                children = parent.children(recursive=True)
+                for child in children:
+                    try:
+                        child.terminate()
+                    except psutil.NoSuchProcess:
+                        pass
+                parent.terminate()
+            else:
+                process.terminate()
+        except (OSError, psutil.Error if psutil else OSError) as exc:
+            logger.warning("Could not terminate downloader process: %s", exc)
+
+    def toggle_pause(self, pause: bool):
+        """
+        Pauses or resumes the download process tree.
+        """
+        if not psutil:
+            logger.error("psutil not found. Cannot pause or resume.")
+            raise RuntimeError("psutil library is not loaded.")
+
+        if not self.process:
+            logger.warning("Attempted to pause/resume, but no process is running.")
+            return
+
+        target_action = "pausing" if pause else "resuming"
+
+        try:
+            parent = psutil.Process(self.process.pid)
+            children = parent.children(recursive=True)
+            processes = [parent] + children
+
+            for proc in processes:
+                try:
+                    if pause:
+                        proc.suspend()
+                    else:
+                        proc.resume()
+                except psutil.NoSuchProcess:
+                    logger.warning(f"Process {proc.pid} no longer exists. Skipping.")
+
+            result_status = "paused" if pause else "resumed"
+            logger.info(f"Download process tree {result_status}.")
+
+        except psutil.NoSuchProcess:
+            logger.error(
+                f"Main process {self.process.pid} not found. Cannot pause/resume."
+            )
+            self.process = None
+        except psutil.Error as e:
+            logger.error(f"An error occurred while {target_action} process: {e}")
+            raise
+
+

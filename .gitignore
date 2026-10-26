@@ -1,0 +1,66 @@
+# ── AppImage & distribution archives (too large for git; use GitHub Releases) ───
+*.AppImage
+*.AppImage.bak
+*.tar.gz
+*tar.gz
+*.tar.gsz
+*tar.gsz
+*.zip
+*.sha256
+
+# ── Personal config with API keys ───────────────────────────────────────────
+# The real config lives at ~/.config/Tachibana Labs/AccelaCLI.conf
+# Only config.example.conf (styling only, no keys) is tracked
+AccelaCLI.conf
+
+# ── Runtime / cache ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyc
+.venv/
+*.log
+logs/
+
+# ── Temp/working dirs ────────────────────────────────────────────────────────
+backups/
+depots/
+manifests/
+morrenus_manifests/
+hubcap_manifests/
+*.db
+
+# ── Workshop keys (personal) ────────────────────────────────────────────────
+workshop_keys.txt
+
+# ── GIFs (large media) ──────────────────────────────────────────────────────
+gifs/
+
+# ── Local scratch space ─────────────────────────────────────────────────────
+# scripts/ is intentionally TRACKED — the pre-release checker and test suite
+# are the gate against shipping a broken build, so they belong in history.
+# Only throwaway experiments go in scratch/.
+scratch/
+
+# ── Plugin distribution & R2 publishing ──────────────────────────────────────
+plugins_manifest.json
+plugins/
+r2-publish/
+.wrangler/
+cloud/
+depotmapping.md
+pluginfindings.md
+
+# ── Optional components (downloaded on demand from R2) ───────────────────────
+src/deps/Goldberg/
+src/deps/Steamless/
+src/deps/SLScheevo/
+
+# ── OS junk ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── VitePress / Docs ────────────────────────────────────────────────────────
+node_modules/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
