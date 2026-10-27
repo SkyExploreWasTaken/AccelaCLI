@@ -74,7 +74,7 @@ jobs:
             archive: tar.gz
             executable: AccelaCLI
           - platform: macos-x64
-            runner: macos-13
+            runner: macos-15-intel
             archive: tar.gz
             executable: AccelaCLI
           - platform: macos-arm64
