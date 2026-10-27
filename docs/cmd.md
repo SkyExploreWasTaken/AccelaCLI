@@ -3,6 +3,15 @@
 AccelaCLI is a command-line-only application. It does not create a Qt GUI or
 wait for interactive depot selections.
 
+Depot downloads require the externally installed **.NET 9 runtime** because
+AccelaCLI runs the bundled DepotDownloader assembly. The runtime is not
+embedded in the application package; the .NET SDK is not required. Install it
+from <https://dotnet.microsoft.com/download/dotnet/9.0> and verify it with:
+
+```text
+dotnet --list-runtimes
+```
+
 ## Download from an AppID
 
 ```text

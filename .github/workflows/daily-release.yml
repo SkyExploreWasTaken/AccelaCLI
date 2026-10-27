@@ -1,0 +1,165 @@
+name: Daily portable release
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: daily-portable-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Check latest commit
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.release-check.outputs.should_build }}
+      commit_sha: ${{ steps.commit.outputs.commit_sha }}
+      commit_short_sha: ${{ steps.commit.outputs.commit_short_sha }}
+      commit_subject: ${{ steps.commit.outputs.commit_subject }}
+      release_tag: ${{ steps.commit.outputs.release_tag }}
+    steps:
+      - name: Check out default branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Read latest commit
+        id: commit
+        shell: bash
+        run: |
+          sha="$(git rev-parse HEAD)"
+          short_sha="$(git rev-parse --short=7 HEAD)"
+          subject="$(git log -1 --pretty=%s)"
+          {
+            echo "commit_sha=$sha"
+            echo "commit_short_sha=$short_sha"
+            echo "commit_subject=$subject"
+            echo "release_tag=build-$sha"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this commit already has a release
+        id: release-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.commit.outputs.release_tag }}
+        shell: bash
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "This commit already has release $RELEASE_TAG."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No release found for this commit."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build ${{ matrix.platform }}
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x64
+            runner: windows-latest
+            archive: zip
+            executable: AccelaCLI.exe
+          - platform: linux-x64
+            runner: ubuntu-24.04
+            archive: tar.gz
+            executable: AccelaCLI
+          - platform: macos-x64
+            runner: macos-13
+            archive: tar.gz
+            executable: AccelaCLI
+          - platform: macos-arm64
+            runner: macos-14
+            archive: tar.gz
+            executable: AccelaCLI
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.commit_sha }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install application and build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install -r packaging/requirements-build.txt
+
+      - name: Build executable
+        run: python packaging/build.py --clean
+
+      - name: Smoke-test executable
+        shell: bash
+        run: |
+          ./dist/${{ matrix.executable }} --help
+          ./dist/${{ matrix.executable }} serve --help
+
+      - name: Package Windows archive
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        env:
+          COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.commit_short_sha }}
+        run: |
+          $archive = "AccelaCLI-$env:COMMIT_SHORT_SHA-${{ matrix.platform }}.zip"
+          Compress-Archive -Path "dist\${{ matrix.executable }}" -DestinationPath $archive
+
+      - name: Package Unix archive
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        env:
+          COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.commit_short_sha }}
+        run: |
+          archive="AccelaCLI-${COMMIT_SHORT_SHA}-${{ matrix.platform }}.tar.gz"
+          tar -czf "$archive" -C dist "${{ matrix.executable }}"
+
+      - name: Upload packaged artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AccelaCLI-${{ matrix.platform }}
+          path: AccelaCLI-*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish release
+    needs:
+      - prepare
+      - build
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: AccelaCLI-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          COMMIT_SHA: ${{ needs.prepare.outputs.commit_sha }}
+          COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.commit_short_sha }}
+          COMMIT_SUBJECT: ${{ needs.prepare.outputs.commit_subject }}
+        run: |
+          title="${COMMIT_SHORT_SHA} - ${COMMIT_SUBJECT}"
+          gh release create "$RELEASE_TAG" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$COMMIT_SHA" \
+            --title "$title" \
+            --notes "Automated portable build for commit ${COMMIT_SHA}."

@@ -52,6 +52,90 @@ installed. Optional integrations remain platform-specific: Steamless
 post-processing is Windows-only, Netsock is Linux/SteamOS-only, and some
 Steam-specific post-processing is naturally limited by the host platform.
 
+## System requirement: .NET 9
+
+AccelaCLI uses the bundled DepotDownloader assembly for depot downloads. That
+assembly targets **.NET 9**, so the .NET 9 runtime must be installed separately
+on the host. The runtime is intentionally not embedded in AccelaCLI releases:
+including a self-contained .NET runtime for Windows, Linux, and macOS would
+add a substantial platform-specific download to every release. The .NET
+runtime is sufficient; the full .NET SDK is not required.
+
+Install the .NET 9 runtime using Microsoft's official instructions for your
+operating system:
+
+<https://dotnet.microsoft.com/download/dotnet/9.0>
+
+Verify the installation with:
+
+```text
+dotnet --list-runtimes
+```
+
+The output should include `Microsoft.NETCore.App 9.x`.
+
+## Portable builds
+
+AccelaCLI can be packaged as a portable **single-file** executable with
+PyInstaller. The executable contains the Python runtime, Python dependencies,
+resources, and bundled DepotDownloader files. .NET 9 is still required
+separately for actual depot downloads.
+
+From a checkout with the project dependencies installed:
+
+```text
+python -m pip install -r packaging/requirements-build.txt
+python packaging/build.py --clean
+```
+
+The resulting executable is:
+
+```text
+dist/AccelaCLI.exe
+```
+
+Run the executable from that directory:
+
+```text
+dist/AccelaCLI.exe --help
+```
+
+No `_internal` directory or other application files are required beside the
+executable. PyInstaller extracts its embedded files to a temporary directory
+while the process runs and removes them when it exits. User settings, logs,
+downloaded components, and caches remain in AccelaCLI's normal per-user data
+directories.
+
+Build each release on its target operating system. PyInstaller output is not
+portable between Windows, Linux, and macOS, so a Windows build must be made on
+Windows, a Linux build on Linux, and a macOS build on macOS.
+
+## Automated daily releases
+
+The repository includes a GitHub Actions workflow at
+`.github/workflows/daily-release.yml`. It runs once per day and can also be
+started manually from the Actions tab. Each run checks the latest commit on
+the default branch. If that commit already has a release, the workflow exits
+without building anything. Otherwise it builds native single-file executables
+for:
+
+- Windows x64
+- Linux x64
+- macOS x64
+- macOS arm64
+
+The four archives are published together in one release. Release names use
+the latest commit's short ID and subject, for example:
+
+```text
+4438c37 - Make the Hubcap's Manifest API working again
+```
+
+The workflow uses an internal `build-<full-commit-id>` tag to detect whether a
+commit has already been published. The repository's Actions setting must allow
+workflows to create releases, and the workflow has `contents: write`
+permission for that purpose.
+
 ## Quick start
 
 ### Windows Command Prompt
