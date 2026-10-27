@@ -34,8 +34,14 @@ class CommandOutput:
             print(f"[{name}]", flush=True)
 
 
+def _argument_parser(**kwargs: Any) -> argparse.ArgumentParser:
+    if sys.version_info >= (3, 14):
+        kwargs["color"] = True
+    return argparse.ArgumentParser(**kwargs)
+
+
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _argument_parser(
         prog="AccelaCLI",
         description="Download Steam depots from an AccelaCLI manifest.",
     )

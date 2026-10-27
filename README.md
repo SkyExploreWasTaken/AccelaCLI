@@ -108,7 +108,10 @@ directories.
 
 Build each release on its target operating system. PyInstaller output is not
 portable between Windows, Linux, and macOS, so a Windows build must be made on
-Windows, a Linux build on Linux, and a macOS build on macOS.
+Windows, a Linux build on Linux, and a macOS build on macOS. The automated
+release workflow builds with Python 3.15, which also preserves the colored
+help output provided by Python's modern `argparse` implementation. The source
+application remains compatible with Python 3.13 and newer.
 
 ## Automated daily releases
 
