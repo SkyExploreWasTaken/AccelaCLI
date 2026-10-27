@@ -124,8 +124,8 @@ for:
 - macOS x64
 - macOS arm64
 
-The four archives are published together in one release. Release names use
-the latest commit's short ID and subject, for example:
+The four standalone binaries are published together in one release. Release
+names use the latest commit's short ID and subject, for example:
 
 ```text
 4438c37 - Make the Hubcap's Manifest API working again
@@ -134,7 +134,10 @@ the latest commit's short ID and subject, for example:
 The workflow uses an internal `build-<full-commit-id>` tag to detect whether a
 commit has already been published. The repository's Actions setting must allow
 workflows to create releases, and the workflow has `contents: write`
-permission for that purpose.
+permission for that purpose. The Linux and macOS assets are raw executable
+files; after downloading them, users may need to run `chmod +x` before the
+first launch because some browsers and download tools do not preserve Unix
+executable permissions.
 
 ## Quick start
 

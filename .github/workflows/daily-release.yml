@@ -67,19 +67,15 @@ jobs:
         include:
           - platform: windows-x64
             runner: windows-latest
-            archive: zip
             executable: AccelaCLI.exe
           - platform: linux-x64
             runner: ubuntu-24.04
-            archive: tar.gz
             executable: AccelaCLI
           - platform: macos-x64
             runner: macos-15-intel
-            archive: tar.gz
             executable: AccelaCLI
           - platform: macos-arm64
             runner: macos-14
-            archive: tar.gz
             executable: AccelaCLI
     runs-on: ${{ matrix.runner }}
     steps:
@@ -108,25 +104,26 @@ jobs:
           ./dist/${{ matrix.executable }} --help
           ./dist/${{ matrix.executable }} serve --help
 
-      - name: Package Windows archive
-        if: matrix.archive == 'zip'
+      - name: Rename Windows executable
+        if: runner.os == 'Windows'
         shell: pwsh
         env:
           COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.commit_short_sha }}
         run: |
-          $archive = "AccelaCLI-$env:COMMIT_SHORT_SHA-${{ matrix.platform }}.zip"
-          Compress-Archive -Path "dist\${{ matrix.executable }}" -DestinationPath $archive
+          Copy-Item "dist\${{ matrix.executable }}" `
+            "AccelaCLI-$env:COMMIT_SHORT_SHA-${{ matrix.platform }}.exe"
 
-      - name: Package Unix archive
-        if: matrix.archive == 'tar.gz'
+      - name: Rename Unix executable
+        if: runner.os != 'Windows'
         shell: bash
         env:
           COMMIT_SHORT_SHA: ${{ needs.prepare.outputs.commit_short_sha }}
         run: |
-          archive="AccelaCLI-${COMMIT_SHORT_SHA}-${{ matrix.platform }}.tar.gz"
-          tar -czf "$archive" -C dist "${{ matrix.executable }}"
+          cp "dist/${{ matrix.executable }}" \
+            "AccelaCLI-${COMMIT_SHORT_SHA}-${{ matrix.platform }}"
+          chmod +x "AccelaCLI-${COMMIT_SHORT_SHA}-${{ matrix.platform }}"
 
-      - name: Upload packaged artifact
+      - name: Upload executable artifact
         uses: actions/upload-artifact@v4
         with:
           name: AccelaCLI-${{ matrix.platform }}
@@ -142,7 +139,7 @@ jobs:
     if: needs.prepare.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download platform archives
+      - name: Download platform executables
         uses: actions/download-artifact@v4
         with:
           pattern: AccelaCLI-*
